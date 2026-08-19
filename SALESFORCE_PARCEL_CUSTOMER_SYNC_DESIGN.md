@@ -41,19 +41,20 @@ Sample file (`Sample_Data.xlsx`, sheet `Sheet1`) columns and their target mappin
 
 All three sample rows have `status = 'A'` and `prc_own_name == cust_name`, so the sample doesn't exercise an ownership-change or new-customer scenario — the logic below is designed from the written process description, not inferred from the sample.
 
-## 4. Assumptions & Open Questions
+## 4. Assumptions & Open Questions — CONFIRMED (see also §11)
 
-I was unable to get these confirmed interactively (the clarifying-question tool failed on a transient connection error), so they're called out explicitly here — please correct any of these before implementation begins:
+The following were confirmed with the user against the actual `NCC_Data_Upload_Guide.pdf` process description:
 
-1. **Owner-change detection key:** compare on `cust_number` (→ `Customer_Number__c`) as the primary key against the customer currently linked via the "Owner" junction for that parcel; fall back to a trimmed `cust_name` match only if `cust_number` is blank.
+1. **Owner-change detection key:** compare on `cust_number` (→ `Customer_Number__c`) as the primary, stable external-ID key against the customer currently linked via the "Owner" `Parcel_Customer__c` junction for that parcel — **not** a same-row name comparison (see the bug called out in §11). Name comparison is fallback-only / low-confidence, never the primary signal.
 2. **File layout:** designed for the current single flat sheet (one row = parcel + customer combined). The staging schema below is generic enough to also accept a normalized multi-sheet feed (separate Parcel / Customer / Role sheets) later — worth pursuing since your provider is open to splitting the file, as it would remove redundancy and simplify matching, but not required for v1.
 3. **`status` column:** assumed `'A'` = Active/valid and safe to process; any other value or blank is routed to an error/review queue rather than silently processed or silently dropped.
 4. **`ZoneCode`:** assumed to map to a `Zone_Code__c` field on `Parcel`, proposed to be created if it doesn't exist.
-5. **External ID fields:** assumed none currently exist for matching. This design proposes adding:
-   - `Parcel.Parcel_Number__c` (External ID, Unique) — enables native `upsert` on Parcel.
-   - `Customer_Id__c.Customer_Number__c` (External ID, Unique) — enables native `upsert` on Customer_Id__c.
-   - `Account` has no native External ID story here because of the known duplicates; it's matched by trimmed Name + "most recently created wins," not upserted (see §7).
-6. **New parcels:** the original process describes only updating *existing* parcels ("identify the available parcels in the org"). This design assumes parcels not found in Salesforce are **flagged for manual review**, not auto-created — confirm if new-parcel auto-creation is actually wanted.
+5. **External ID fields:** confirmed — add a stable external ID as the primary match key rather than relying on name/address fuzzy matching:
+   - `Parcel.Parcel_Number__c` (External ID, Unique) — enables native lookup on Parcel (update-only; see point 6, no upsert/auto-create).
+   - `Customer_Id__c.Customer_Number__c` (External ID, Unique) — enables native `upsert` on Customer_Id__c and is the primary owner-change match key.
+   - `Account` has no native External ID story here because of the known duplicates; **a one-time cleanup/merge pass over existing duplicate Accounts is now in scope for this project** (see §12) so that, post-cleanup, new Accounts are resolved via the `Customer_Id__c → Account` relationship rather than by name-matching against a still-messy pool. Name + "most recently created wins" is retained only as the cleanup-pass heuristic and for genuinely first-time Account creation (see §7).
+6. **New parcels:** confirmed — the original process only updates *existing* parcels. Parcels not found in Salesforce are **flagged for manual review**, never auto-created.
+7. **Ingestion automation:** confirmed **in scope for this project**, not deferred to a later phase — see revised §6.
 
 ## 5. Staging Layer Design
 
@@ -68,14 +69,16 @@ A custom object `Parcel_Customer_Staging__c` holds one record per source row bef
 
 **Normalization on load (not in Excel):** immediately after insert (via a `before insert` trigger or the loader step itself), every text field is trimmed and collapsed of redundant internal whitespace. This removes the org's current dependency on someone remembering to run Excel's `TRIM()` before upload.
 
-## 6. Ingestion Options (Phased)
+## 6. Ingestion Options (Phased build, single project)
+
+**Update:** the user has confirmed that fully automating file ingestion (not just downstream reconciliation) is in scope for this project — it will not be deferred indefinitely as a separate future initiative. However, the *build sequence* is still phased for risk-reduction reasons:
 
 | Phase | Approach | Automation level | Effort |
 |---|---|---|---|
-| **Phase 1** (recommended start) | Data Loader or the standard Data Import Wizard loads the monthly file directly into `Parcel_Customer_Staging__c`; an Apex batch (scheduled or manually kicked off) does everything downstream. | Partial — file drop-off is manual, all reconciliation logic is automatic | Low — no new integration surface, uses existing tooling |
-| **Phase 2** | Add an Apex **Inbound Email Handler** (source system emails the file monthly to a Salesforce-generated address) or a scheduled **Bulk API** pull from wherever the source system lands the file (SFTP/shared drive), parsing straight into staging. | Full | Medium — needs an email service or scheduled integration job, plus file-parsing (CSV is simplest; xlsx needs a parsing library or a request to have the source export CSV) |
+| **Phase 1** (build & prove first) | Data Loader or the standard Data Import Wizard loads the monthly file directly into `Parcel_Customer_Staging__c`; the Apex batch chain (scheduled or manually kicked off) does everything downstream. | Partial — file drop-off is manual, all reconciliation logic is automatic | Low — no new integration surface, uses existing tooling |
+| **Phase 2** (built in the same project, wired on after Phase 1 is proven) | Add an Apex **Inbound Email Handler** (source system emails the file monthly to a Salesforce-generated address) or a scheduled **Bulk API** pull from wherever the source system lands the file (SFTP/shared drive), parsing straight into staging, plus a volume-anomaly check (hold for manual approval if row count deviates sharply from the prior month) so a malformed or wrong file doesn't auto-process. | Full | Medium — needs an email service or scheduled integration job, plus file-parsing (CSV is simplest; xlsx needs a parsing library or a request to have the source export CSV) |
 
-Recommendation: ship Phase 1 first since the user already agreed to the staging + batch approach; it delivers ~90% of the time savings (all the error-prone manual matching) with minimal new infrastructure. Revisit Phase 2 once Phase 1 has run reliably for a couple of cycles.
+Recommendation: build and validate Phase 1 (reconciliation logic) against a full historical file with a human still uploading it, *then* wire in Phase 2 ingestion automation within the same overall project — a matching-logic bug is far easier to catch and fix while a human is still in the loop on the file drop-off step.
 
 ## 7. Processing Logic (Apex Batch Design)
 
@@ -126,6 +129,8 @@ else:
 
 Worked example using the sample rows: all three rows have `prc_own_name == cust_name` and (in this sample) no pre-existing junction is assumed, so each would fall into the "no existing owner link → insert new Owner junction" branch on a first run.
 
+> **⚠ Known discrepancy — code vs. this design (must fix before build continues):** the pseudocode above is correct — it compares the incoming customer against the *currently stored Salesforce Owner* (`existingOwnerLink.Customer_Id__c`). The current `ParcelCustomerSyncBatch.cls` implementation does **not** do this; it instead sets `ownerChanged` by comparing two columns on the *same incoming row* (`Prc_Own_Name__c` vs `Cust_Name__c`), which is a same-row data-quality check, not owner-change detection against Salesforce state. This needs to be corrected in Batch C to match the pseudocode above — using `Customer_Number__c` (external ID) as the comparison key, not a name comparison — before this goes further than sandbox testing. Also verify `Census_Tract__c` (per the actual upload guide) vs. the code's `Census_Track__c` and the object's actual singular/plural name against the real org schema — see §11.
+
 ### Finish step
 - Mark each processed staging row `Processed`, or `Error` with `Error_Message__c` populated.
 - Send a summary email (or post to a Slack/Chatter feed) with counts: parcels updated, junctions created, junctions re-qualified to Care Of, new Customers/Accounts created, rows skipped/errored.
@@ -151,10 +156,49 @@ Worked example using the sample rows: all three rows have `prc_own_name == cust_
 
 1. **Sandbox first:** create the two proposed External ID fields, the staging object, and the three chained batch classes in a full sandbox; run against a full historical monthly file (not just the 3-row sample) to validate the Account dedup rule and owner-change logic against real duplicate data.
 2. **Phase 1 go-live:** keep the manual Data Loader upload into staging, let the batch chain run automatically after; developer just watches the summary email and the error queue.
-3. **Phase 2 (later):** automate ingestion itself (inbound email handler or scheduled pull) once Phase 1 has proven stable for 1–2 monthly cycles, removing the last manual step.
+3. **Phase 2 (built in this same project, wired on once Phase 1 is stable for 1–2 monthly cycles):** automate ingestion itself (inbound email handler or scheduled pull), removing the last manual step.
+
+## 11. Field/Object Naming — Verify Against Real Org Before Any Deploy
+
+Cross-checking this design and the existing Apex against the actual `NCC_Data_Upload_Guide.pdf` process description surfaced naming drift that **must be resolved against the live org schema before any metadata deploy** (a wrong API name fails as a deploy error, not a runtime bug):
+
+| Item | This doc / Apex uses | The actual upload guide's SOQL uses | Action |
+|---|---|---|---|
+| Census Tract field | `Census_Track__c` (Apex), `CensusTract__c` (this doc, §5/§7) | `Census_Tract__c` | Confirm the real field name in the org; standardize all references to it before build. |
+| Junction object | `Parcel_Customer__c` (singular) | `Parcel_Customer__c` (singular) | Matches — but note the original task description referred to it as `Parcel_Customers__c` (plural); confirm which is correct in the org. |
+| Customer object | `Customer_Id__c` / `Customer_ID__c` | `Customer_ID__c` | Case only — confirm exact casing (Salesforce API names are effectively case-preserving in metadata even though SOQL is case-insensitive). |
+
+## 12. Duplicate Account Cleanup (One-Time Pass — Now In Scope)
+
+Confirmed with the user: rather than only preventing *new* duplicates going forward, this project includes a **one-time cleanup/merge pass** over Accounts that already have duplicates in the org (created by past manual uploads), before automated reconciliation is turned on.
+
+- **Discovery first:** run a duplicate-count report (trimmed Name + Billing address similarity) before committing to a cleanup timeline — actual volume is currently unknown and could swing the estimate below significantly.
+- **Merge execution:** for each duplicate group, keep one canonical Account (default: most-recently-created, matching the org's existing informal convention) and merge/re-point any `Customer_Id__c` and `Parcel_Customer__c` records currently linked to the Accounts being retired.
+- **Ambiguous cases** (e.g., genuinely distinct entities with similar names, such as "Smith Family Trust" vs. "Smith Family Trust II") are routed to manual review, never auto-merged on a fuzzy match alone.
+- This pass is a **hard prerequisite** to building/testing Batch B's Account-resolution logic — testing dedup-dependent logic against a still-messy Account base produces misleading test results.
+
+## 13. Effort Estimate (Phased)
+
+| Phase | Work | Estimate |
+|---|---|---|
+| 1. Design finalize + org verification | Resolve the naming discrepancies in §11, confirm/create the two External ID fields, obtain a full historical monthly file (not the 3-row sample) | 2–3 days |
+| 2. Duplicate Account cleanup (one-time, §12) | Discovery report, merge decisions, execute merges, re-point existing lookups | 3–5 days (depends on duplicate volume — unknown, see Risks) |
+| 3. Sandbox build — staging object + Batch A/B/C | Create `Parcel_Customer_Staging__c`, build/fix the three chained batches (including the owner-change logic fix in §7's callout), build the exception list view/report | 5–7 days |
+| 4. Ingestion automation (§6 Phase 2) | Inbound email handler or scheduled SFTP/Bulk API pull into staging, file-format validation, volume-anomaly hold | 3–5 days |
+| 5. Testing | Full historical file run, plus constructed test rows for: genuine ownership change, same-owner data-quality mismatch, brand-new customer, existing-but-unlinked customer, parcel not in Salesforce, malformed row | 3–4 days |
+| 6. Rollout | Production deploy, first live cycle run in parallel with a manual spot-check, monitor exception queue | 2–3 days + 1 monthly cycle of parallel-run monitoring |
+
+**Total: roughly 4–5 weeks**, plus one full monthly cycle running in shadow/parallel mode before the manual process is retired. **Recommended sequencing:** build and prove Phases 1–3 (reconciliation logic) against a full historical file while a human still uploads it, before wiring in Phase 4 ingestion automation — a matching-logic bug is much easier to catch and fix while a human is still in the loop on file drop-off. Phase 2 (dedup cleanup) is a hard prerequisite to Phase 3, not parallelizable with it.
+
+## 14. Concerns & Risks
+
+- **Ownership change vs. data-quality mismatch:** fixed logic (§7 callout) compares the incoming customer's `Customer_Number__c` against the currently-stored Salesforce Owner — but this assumes the source system's `cust_number` is stable and never reissued for a different real-world owner. If it ever is, that would misfire as "no change" when one occurred. Recommend a plausibility check (flag if `Cust_Name__c` changes materially while `cust_number` stays the same, or vice versa) routed to manual review rather than auto-applied.
+- **Duplicate Accounts:** cleanup volume (§12) is unknown until the discovery pass runs — the 3–5 day estimate could expand for widespread or genuinely-ambiguous duplication.
+- **Records present in the file but missing from Salesforce, and vice versa:** parcels in the file with no SF match are flagged for review, never auto-created (matches the guide). SF parcels/customers absent from a given month's file are left untouched — this design never deactivates a parcel or downgrades a customer link solely because it's missing from one month's file. If a parcel is subdivided or retired at the county level, this design has no mechanism to detect or flag that — confirm this is acceptable.
+- **Bad monthly file / rollback:** per-row DML with `allOrNone=false` means one bad row never blocks the batch; the staging object is the audit trail. A bad *whole file* (wrong format, wrong month, truncated) should be caught by the Phase 2 ingestion volume-anomaly check before it reaches the batches at all, holding for manual approval. All failures surface via per-row `Error_Message__c`, the exception list view, and the finish-step summary email — nothing fails silently.
 
 ## Verification (of this document)
 
 - Every column present in the actual uploaded sample file is accounted for in §3's mapping table.
 - Every one of the 4 manually-performed steps in the original process maps to a specific batch/step in §7.
-- Every place a decision was made without explicit user confirmation is called out in §4 rather than silently assumed.
+- Every place a decision was made without explicit user confirmation is called out in §4 rather than silently assumed, and every naming/logic discrepancy found against the actual upload guide is called out in §7 and §11 rather than silently reconciled.
