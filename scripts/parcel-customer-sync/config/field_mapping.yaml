@@ -1,0 +1,43 @@
+# Confirmed Salesforce field API names for the Parcel/Customer sync tool.
+#
+# THIS FILE IS A TEMPLATE. Every value below is a PLACEHOLDER guess and must be
+# confirmed against the real org via Phase 0 schema discovery before this tool
+# is run for real:
+#
+#   sf sobject describe --sobject Parcel__c        --target-org pc-sync-sandbox --json
+#   sf sobject describe --sobject Customer_Id__c   --target-org pc-sync-sandbox --json
+#   sf sobject describe --sobject Account           --target-org pc-sync-sandbox --json
+#   sf sobject describe --sobject Parcel_Customer__c --target-org pc-sync-sandbox --json
+#
+# Both pipeline entrypoints re-validate these field names against a live
+# `sf sobject describe` call at the start of every run and fail fast if a
+# configured field no longer exists -- so an out-of-date value here is caught
+# immediately, not silently.
+#
+# Also confirm during Phase 0: the exact defined picklist values on
+# Parcel_Customer__c.Association_Role__c -- in particular that 'Owner' and
+# 'Previous Owner' exist verbatim (case/spacing) as configured below.
+
+parcel:
+  sobject: Parcel__c
+  name_field: Name              # matches sheet's "Parcel" column
+  census_tract_field: CensusTract__c   # PLACEHOLDER -- confirm real API name
+
+customer:
+  sobject: Customer_Id__c
+  name_field: Name               # matches sheet's "cust_number" column
+  account_lookup_field: Account__c     # PLACEHOLDER -- confirm real API name
+
+account:
+  sobject: Account
+
+parcel_customer:
+  sobject: Parcel_Customer__c
+  parcel_lookup_field: Parcel__c            # PLACEHOLDER -- confirm real API name
+  customer_lookup_field: Customer_Id__c     # PLACEHOLDER -- confirm real API name
+  account_lookup_field: Account__c          # PLACEHOLDER -- confirm real API name
+  association_role_field: Association_Role__c
+
+roles:
+  owner: "Owner"                 # PLACEHOLDER -- confirm exact picklist value
+  previous_owner: "Previous Owner"   # PLACEHOLDER -- confirm exact picklist value

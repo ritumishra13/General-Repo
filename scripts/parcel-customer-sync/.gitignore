@@ -1,0 +1,11 @@
+data/inbox/*
+data/processed/*
+data/review/*
+data/tmp/*
+!data/inbox/.gitkeep
+!data/processed/.gitkeep
+!data/review/.gitkeep
+!data/tmp/.gitkeep
+__pycache__/
+*.pyc
+.pytest_cache/
