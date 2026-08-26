@@ -28,28 +28,40 @@ Relationship: one `Parcel__c` can have many `Parcel_Customer__c` records over ti
 
 ## 3. Source File Analysis
 
-Sample file (`Sample_Data.xlsx`, sheet `Sheet1`) columns and their target mapping:
+The monthly feed actually arrives as **two separate files**, not one flat sheet:
+
+**`NCC_Parcel_CensusTract_Data_Sample.xlsx` (sheet `Sheet1`)** — 2 columns, 1 row per parcel:
+
+| Source column | Sample value | Maps to |
+|---|---|---|
+| `Parcel` | `2601520186` | `Parcel__c.Name` — the only unique/External ID field in this model |
+| `CensusTract` | `2` | `Parcel__c.Census_Track__c` |
+
+**`NCC_Parcel_Customer_Data_Sample.xlsx` (sheet `Sheet3`)** — 16 columns, 1 row per parcel+customer:
 
 | Source column | Sample value | Maps to | Notes |
 |---|---|---|---|
-| `Parcel` | `2600920086` | `Parcel__c.Name` | Existing unique/External ID field — the only one in this model |
-| `prc_loc_addr_no`, `prc_loc_street_dir`, `prc_loc_street_name`, `prc_loc_street_type`, `prc_loc_zip` | `412`, `None`, `HAWTHORNE`, `DR   `, `19802` | `Parcel__c` address fields | Note trailing spaces on street type (`'DR   '`) — confirms the whitespace issue the user described |
-| `prc_own_name`, `prc_own_address1/2`, `prc_own_city/state/zip` | `JODKO PROPERTIES ONE LLC`, `405 MILTON DR`, …, `WILMINGTON          ` | Reference only / owner-of-record as reported by source | Used to sanity-check against `cust_*`, not written directly to Salesforce |
-| `cust_number` | `284336` | `Customer_Id__c.Name` | Used to look up an existing `Customer_Id__c`; not an External ID, so matching is query-based, not `upsert`-based |
-| `cust_name`, `cust_addr1/2`, `cust_city/state/zip` | `JODKO PROPERTIES ONE LLC`, `405 MILTON DR                           `, …, `WILMINGTON          ` | `Account.Name` (reached via `Customer_Id__r.Account.Name`) + address | Trailing spaces confirmed here too — must be trimmed before any lookup/dedup |
-| `CensusTract` | `2` | `Parcel__c.Census_Track__c` | Direct update per Step 1 |
-| `ZoneCode` | `26R-1` | `Parcel__c.Zone_Code__c` (proposed if it doesn't exist) | Not mentioned in the original 4 steps but present in every row — included for completeness |
+| `Parcel` | `2601520186` | `Parcel__c.Name` | Same key as the census-tract file; the two files agree on every parcel in the sample |
+| `prc_own_name`, `prc_own_address1/2`, `prc_own_city/state/zip` | `MCBRIDE LILLIAN`, `3110 N MONROE ST`, …, `WILMINGTON`, `DE`, `19802` | Reference only / owner-of-record as reported by source | Used to sanity-check against `cust_*`, not written directly to Salesforce |
+| `cust_number` | `80449` | `Customer_Id__c.Name` | Not an External ID — matching is query-based |
+| `cust_name`, `cust_addr1/2`, `cust_city/state/zip` | `MCBRIDE LILLIAN`, `3110 N MONROE ST`, …, `WILMINGTON`, `DE`, `19802` | `Account.Name` (via `Customer_Id__r.Account.Name`) + address | Trim before any lookup/dedup — some real rows still carry trailing spaces or a `ZIP+4` (`19802-3007`) |
+| `CensusTract` | `2` | `Parcel__c.Census_Track__c` | Duplicated from the census-tract file — the sample's values agree between both files for every parcel, but treat the census-tract file as authoritative for Step 1 |
+| `ZoneCode` | `26R-2` | `Parcel__c.Zone_Code__c` (proposed if it doesn't exist) | Not mentioned in the original 4 steps but present in every row — included for completeness |
+
+An earlier version of the customer sample also carried `Current Cust_Num` / `Current Owner Name` columns — those were a manual lookup the preparer had done against Salesforce for comparison purposes, **not** part of the real monthly feed, and have been dropped from the sample. Don't design against them.
 
 There is no `status` column in the current source file. An older version of the feed had one (`A` = active parcel), but the client now only sends active parcels, so this column and any related filtering logic no longer apply.
 
-All three sample rows have `prc_own_name == cust_name`, so the sample doesn't exercise an ownership-change or new-customer scenario — the logic below is designed from the written process description, not inferred from the sample.
+**Confirmed system state for this sample:** all 18 parcel numbers in the sample already exist as `Parcel__c` records in the sandbox. Their `Census_Track__c` value and whatever `Customer_Id__c`/`Account`/`Parcel_Customer__c` is currently linked to them **may differ from what's in this month's file** — nothing should be assumed unchanged. Every row still needs its current Salesforce state queried (§5 Step A) and compared before deciding whether to update Census Tract or touch the customer/junction records.
+
+All 18 sample rows have `prc_own_name == cust_name`, so the sample doesn't exercise the ownership-change branch of the logic — it only exercises "is this parcel's Census Tract/linked customer already correct, or does it need updating."
 
 ## 4. Assumptions & Open Questions
 
 1. **Owner-change detection key:** compare on `cust_number` (`Customer_Id__c.Name`) as the primary key against the customer currently linked via the "Owner" junction for that parcel; fall back to a trimmed `cust_name` match only if `cust_number` is blank.
 2. **File layout:** designed for the current single flat sheet (one row = parcel + customer combined).
 3. **`ZoneCode`:** assumed to map to a `Zone_Code__c` field on `Parcel__c`, proposed to be created if it doesn't exist.
-4. **New parcels:** the original process describes only updating *existing* parcels ("identify the available parcels in the org"). This design assumes parcel numbers not found in Salesforce are **flagged for manual review**, not auto-created — confirm if new-parcel auto-creation is actually wanted.
+4. **New parcels:** the client only sends parcels that already exist as `Parcel__c` records — this has been confirmed for the current sample. A parcel number that still doesn't match anything in Salesforce (typo, one-off exception) is **flagged for manual review**, not auto-created; this is now a defensive fallback rather than an expected path.
 5. **Account/Customer dedup rule:** when more than one `Account` shares the same trimmed `Name`, the most recently created one is treated as the match (existing org convention).
 
 ## 5. Monthly Workflow (Salesforce CLI + Excel)
@@ -102,16 +114,19 @@ Because `Customer_Id__c.Name` isn't an External ID, steps 2–5 rely on the Ids 
 | Customer moves from "Care Of" back to "Owner" (reactivation) | Treated as a normal ownership change — old owner (if different) → Care Of, a fresh `Owner` junction is created per §5 Step C.5 rather than reusing the old one. |
 | Blank/malformed `Parcel` or `cust_number` | Row routed to the review tab, excluded from all CLI loads for that cycle. |
 | Multiple ownership changes for the same parcel within one file | Same as "appears more than once" — last row wins; only one Care-Of transition is recorded per run. |
-| Parcel number not found in Salesforce | Row routed to the review tab per Assumption 4 — not auto-created. |
+| Parcel number not found in Salesforce | Row routed to the review tab per Assumption 4 — not auto-created. Expected to be rare, since the client only sends parcels already in Salesforce. |
+| Census Tract or linked customer in Salesforce already matches the file | Still explicitly checked via §5 Step A/B on every row — never skipped just because a parcel is "expected" to already exist, since its Census Tract value or its currently-linked customer can legitimately be stale or wrong. |
 
 ## 8. Rollout Recommendation
 
-1. **Sandbox first:** point the CLI at the sandbox (`sf org login web --instance-url https://test.salesforce.com`, matching `sfdx-project.json`'s `sfdcLoginUrl`) and run a full historical monthly file (not just the 3-row sample) through §5 to validate the Account dedup rule and owner-change logic against real duplicate data.
+1. **Sandbox first:** point the CLI at the sandbox (`sf org login web --instance-url https://test.salesforce.com`, matching `sfdx-project.json`'s `sfdcLoginUrl`) and run a full historical monthly file (not just the 18-row sample) through §5 to validate the Account dedup rule and owner-change logic against real duplicate data.
 2. **Production go-live:** once a couple of sandbox cycles run clean, repeat the same CLI + Excel workflow against production.
 
 ## Verification (of this document)
 
-- Every column present in the actual uploaded sample file is accounted for in §3's mapping table, using the corrected object/field names (`Parcel__c`, `Customer_Id__c.Name`, `Account.Name` via `Customer_Id__r`, `Parcel__c.Census_Track__c`).
+- §3 reflects the two real uploaded sample files (`NCC_Parcel_CensusTract_Data_Sample.xlsx`, `NCC_Parcel_Customer_Data_Sample.xlsx`), not a hypothetical single flat sheet — every column in both is accounted for, using the corrected object/field names (`Parcel__c`, `Customer_Id__c.Name`, `Account.Name` via `Customer_Id__r`, `Parcel__c.Census_Track__c`).
+- The stray `Current Cust_Num` / `Current Owner Name` columns from an earlier draft of the customer sample are called out as a one-off manual lookup, not part of the real feed, and excluded from the design.
 - The `status` column and all logic tied to it has been removed — the client now sends only active parcels.
 - The staging-object + Apex-batch approach has been removed; the workflow described in §5–§8 uses only Salesforce CLI and Excel.
 - `Parcel__c.Name` is called out as the only existing unique/External ID field; `Customer_Id__c.Name` is explicitly not treated as one.
+- §3/§4/§7 make explicit that only the `Parcel__c` record's *existence* is guaranteed for these parcel numbers — its `Census_Track__c` value and its currently-linked `Customer_Id__c`/`Account`/`Parcel_Customer__c` must still be queried and checked every run, never assumed to already match the file.
